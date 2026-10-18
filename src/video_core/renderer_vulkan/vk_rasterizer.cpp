@@ -450,6 +450,8 @@ void Rasterizer::EliminateFastClear() {
 
 namespace {
 
+void LogStageResources(const char* tag, const Shader::Info& info, u32 x, u32 y, u32 z);
+
 /// Diagnostic for the 4K darkening: logs, at most once a second for each, the draws of the
 /// exposure chain (known pixel shaders, or render areas of 64x64 or less) with their render
 /// target, sampled images and the first values of their constant buffers.
@@ -465,6 +467,9 @@ void LogLumDebug(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
     const u64 hash = ps->pgm_hash;
     const u32 width = regs.screen_scissor.GetWidth();
     const u32 height = regs.screen_scissor.GetHeight();
+    if (width >= 1600) {
+        LogStageResources("draw", *ps, width, height, 1);
+    }
     const bool watched = hash == 0x94b5b8da || hash == 0x2e624729 || hash == 0xa55dac75;
     if (!watched && (width > 64 || height > 64)) {
         return;
@@ -531,6 +536,53 @@ void LogLumDebug(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
             text += fmt::format("{}{:.5g}", i ? "," : "", values[i]);
         }
         text += "]";
+    }
+    LOG_INFO(Render, "{}", text);
+}
+
+
+/// Diagnostic for the 4K darkening: logs, at most every 3 seconds for each shader and size, the
+/// size of a compute dispatch or full screen draw and the sizes of the buffers and images it
+/// uses, to find resources sized for 1800p.
+void LogStageResources(const char* tag, const Shader::Info& info, u32 x, u32 y, u32 z) {
+    if (Common::Infamous::GetTuning().lum_debug.load(std::memory_order_relaxed) < 2) {
+        return;
+    }
+    static std::unordered_map<u64, std::chrono::steady_clock::time_point> last_logged;
+    static std::chrono::steady_clock::time_point second_start{};
+    static u32 lines_this_second = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - second_start >= std::chrono::seconds(1)) {
+        second_start = now;
+        lines_this_second = 0;
+    }
+    const u64 key = info.pgm_hash ^ (u64(x) << 40) ^ (u64(y) << 20) ^ u64(z) << 60;
+    auto& last = last_logged[key];
+    if (lines_this_second >= 64 || (last != std::chrono::steady_clock::time_point{} &&
+                                     now - last < std::chrono::seconds(3))) {
+        return;
+    }
+    last = now;
+    ++lines_this_second;
+
+    std::string text = fmt::format("ResDebug {} f={} hash={:#x} size={}x{}x{}", tag,
+                                   Common::Infamous::GuestFrameCounter().load(), info.pgm_hash,
+                                   x, y, z);
+    u32 index = 0;
+    for (const auto& desc : info.buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        const auto buffer = desc.GetSharp(info);
+        text += fmt::format(" b{}{}={:#x}+{:#x}", index++, desc.is_written ? "w" : "",
+                            u64(buffer.base_address), buffer.GetSize());
+    }
+    index = 0;
+    for (const auto& desc : info.images) {
+        const auto image = desc.GetSharp(info);
+        text += fmt::format(" i{}={}x{}x{}@{:#x}", index++, static_cast<u32>(image.width) + 1,
+                            static_cast<u32>(image.height) + 1,
+                            static_cast<u32>(image.depth) + 1, image.Address());
     }
     LOG_INFO(Render, "{}", text);
 }
@@ -745,6 +797,7 @@ void Rasterizer::DispatchDirect() {
     if (!bound) {
         return;
     }
+    LogStageResources("dispatch", cs, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     if (compute_ring) {
         Common::Perf::Count(Common::Perf::Counter::ComputeRingDispatches);
     }
