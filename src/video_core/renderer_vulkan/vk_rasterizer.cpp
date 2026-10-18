@@ -470,6 +470,26 @@ void LogLumDebug(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
     if (width >= 1600) {
         LogStageResources("draw", *ps, width, height, 1);
     }
+    if (Common::Infamous::GetTuning().lum_debug.load(std::memory_order_relaxed) >= 3) {
+        static std::unordered_map<u64, u64> seen_targets;
+        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+            const auto& target = regs.color_buffers[i];
+            if (!target) {
+                continue;
+            }
+            const u64 address = target.Address();
+            const u64 shape = (u64(target.Pitch()) << 32) | (u64(target.Height()) << 8) |
+                              static_cast<u32>(target.GetDataFmt());
+            auto [it, inserted] = seen_targets.try_emplace(address, shape);
+            if (inserted || it->second != shape) {
+                it->second = shape;
+                LOG_INFO(Render, "RtDebug f={} ps={:#x} slot={} rt={:#x} {}x{} fmt={} slice={:#x}",
+                         Common::Infamous::GuestFrameCounter().load(), hash, i, address,
+                         target.Pitch(), target.Height(), static_cast<u32>(target.GetDataFmt()),
+                         target.GetColorSliceSize());
+            }
+        }
+    }
     const bool watched = hash == 0x94b5b8da || hash == 0x2e624729 || hash == 0xa55dac75;
     if (!watched && (width > 64 || height > 64)) {
         return;
@@ -949,6 +969,9 @@ void Rasterizer::Finish() {
 void Rasterizer::OnSubmit() {
     Common::Infamous::GuestFrameCounter().fetch_add(1, std::memory_order_relaxed);
     Common::Infamous::RefreshTuning();
+    if (Common::Infamous::GetTuning().lum_debug.load(std::memory_order_relaxed) >= 3) {
+        Common::Infamous::GetReadFaultLog().Dump();
+    }
     occlusion.OnFrameEnd();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();

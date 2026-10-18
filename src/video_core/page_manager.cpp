@@ -11,6 +11,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
+#include "common/infamous_tuning.h"
 #include "common/multi_level_page_table.h"
 #include "common/perf_profiler.h"
 #include "common/signal_context.h"
@@ -525,6 +526,10 @@ struct SignalImpl : public PageManager::Impl {
             }
             return true;
         } else {
+            if (!is_gpu_thread &&
+                Common::Infamous::GetTuning().lum_debug.load(std::memory_order_relaxed) >= 3) {
+                Common::Infamous::GetReadFaultLog().Record(addr);
+            }
             if (!rasterizer->ReadMemory(addr, size, is_gpu_thread)) {
                 return false;
             }

@@ -4,11 +4,13 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <fmt/format.h>
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/types.h"
@@ -38,6 +40,58 @@ inline Tuning& GetTuning() {
 inline std::atomic<u64>& GuestFrameCounter() {
     static std::atomic<u64> counter{0};
     return counter;
+}
+
+/// Diagnostic (lum_debug >= 3): pages of GPU written memory the game threads read, recorded
+/// from the fault handler without locks or allocations and logged every few seconds.
+struct ReadFaultLog {
+    static constexpr u32 Size = 1024;
+    std::array<std::atomic<u64>, Size> pages{};
+    std::array<std::atomic<u32>, Size> counts{};
+
+    void Record(u64 address) noexcept {
+        const u64 page = (address >> 12) + 1;
+        u32 index = static_cast<u32>((page * 0x9E3779B97F4A7C15ull) >> 54) % Size;
+        for (u32 probe = 0; probe < 32; ++probe, index = (index + 1) % Size) {
+            u64 current = pages[index].load(std::memory_order_relaxed);
+            if (current == 0 && pages[index].compare_exchange_strong(current, page)) {
+                current = page;
+            }
+            if (current == page) {
+                counts[index].fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
+
+    void Dump() {
+        static std::chrono::steady_clock::time_point last{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(3)) {
+            return;
+        }
+        last = now;
+        std::string text;
+        u32 listed = 0;
+        for (u32 i = 0; i < Size; ++i) {
+            const u32 count = counts[i].exchange(0, std::memory_order_relaxed);
+            if (count == 0) {
+                continue;
+            }
+            text += fmt::format(" {:#x}:{}", (pages[i].load() - 1) << 12, count);
+            if (++listed >= 96) {
+                break;
+            }
+        }
+        if (!text.empty()) {
+            LOG_INFO(Render, "ReadFaults f={}{}", GuestFrameCounter().load(), text);
+        }
+    }
+};
+
+inline ReadFaultLog& GetReadFaultLog() {
+    static ReadFaultLog log;
+    return log;
 }
 
 /// Reads perf_tuning.ini if it changed since it was last read. Cheap to call often.
