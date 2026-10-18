@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <optional>
+#include <span>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -23,6 +27,111 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+
+/**
+ * Guest occlusion queries counted by the GPU. The guest dumps the depth block sample counters
+ * (ZPASS_DONE) before the draws it tests, at a 16 byte aligned address, and after them, 8 bytes
+ * further; the sum of the differences of the counter pairs is the number of samples that passed
+ * the depth test. The counters run all the time on the GPU, so queries may overlap or nest (a
+ * query around a whole pass containing smaller queries). Here Vulkan occlusion queries count the
+ * samples of consecutive segments of the command stream, shared by all the open guest queries: a
+ * segment ends at each dump and at the end of each rendering scope (Vulkan queries begun in a
+ * rendering scope must end in it, and only one may be active). A guest query reports the
+ * segments between its two dumps, one per counter pair.
+ */
+class OcclusionQueries final : public RenderingObserver {
+public:
+    static constexpr u32 MaxCounterPairs = 16;
+    static constexpr u32 MaxOpenQueries = 16;
+
+    explicit OcclusionQueries(const Instance& instance, Scheduler& scheduler);
+    ~OcclusionQueries() override;
+
+    void OnBeginRendering(const CommandRecorder& cmdbuf) override;
+    void OnEndRendering(const CommandRecorder& cmdbuf) override;
+
+    /// Begin dump: counts the samples of the following draws for the query at this address.
+    /// Returns false when it cannot be counted (too many open queries).
+    bool Begin(VAddr address, u32 num_pairs);
+
+    /// End dump of the query that began at begin_address: stops counting it and fills the Vulkan
+    /// queries that counted its samples, oldest first. Returns false when no counted query began
+    /// there, or when some of its samples were not counted (too many segments).
+    bool End(VAddr begin_address,
+             boost::container::static_vector<u32, MaxCounterPairs>& out_queries);
+
+    /// Stops counting all open queries (real queries turned off).
+    void AbandonAll();
+
+    /// Starts counting again for the open queries after an end dump, if a rendering scope is
+    /// active (otherwise the next one starts counting).
+    void Resume();
+
+    /// End of a guest frame: queries open for several frames are forgotten (never ended), so
+    /// that they do not keep segments and open slots forever.
+    void OnFrameEnd();
+
+    /// The queries are read by the current command buffer: not reused before it completes.
+    void MarkUsed(std::span<const u32> queries);
+
+    [[nodiscard]] bool HasOpen() const noexcept {
+        return !open.empty();
+    }
+
+    /// Whether a counted query begun at this address is open.
+    [[nodiscard]] bool IsOpen(VAddr address) const noexcept {
+        return std::any_of(open.begin(), open.end(),
+                           [address](const OpenQuery& q) { return q.address == address; });
+    }
+
+    [[nodiscard]] u32 NumOpen() const noexcept {
+        return static_cast<u32>(open.size());
+    }
+
+    [[nodiscard]] vk::QueryPool Pool() const noexcept {
+        return *pool;
+    }
+
+private:
+    struct OpenQuery {
+        VAddr address;
+        u32 max_segments;  ///< Counter pairs of the query: one segment each.
+        u32 first_segment; ///< Index in segments of its first segment.
+        u32 frame;         ///< Guest frame of its begin dump.
+        bool incomplete;   ///< Some of its samples were not counted.
+    };
+
+    /// Forgets the segments that no open query needs any more.
+    void DropOldSegments();
+
+    void BeginSegment(const CommandRecorder& cmdbuf);
+    void EndSegment(const CommandRecorder& cmdbuf);
+    /// Ends the active segment: the samples before and after a dump are counted apart.
+    void Cut();
+
+    static constexpr u32 NumQueries = 4096;
+    static constexpr u32 MaxSegments = 256;
+
+    const Instance& instance;
+    Scheduler& scheduler;
+    vk::UniqueQueryPool pool;
+    vk::QueryControlFlags control_flags{};
+    /// GPU tick of the command buffer that last used each query (reused when it completed).
+    std::array<u64, NumQueries> query_ticks{};
+    u32 next_query{};
+    bool active{}; ///< The last segment is counting in the current rendering scope.
+    u32 frame{};   ///< Guest frames ended.
+    boost::container::static_vector<OpenQuery, MaxOpenQueries> open;
+    /// Vulkan queries of the segments since the oldest open query began, in order.
+    boost::container::static_vector<u32, MaxSegments> segments;
+};
+
+/// What the command processor writes for a guest occlusion counter dump.
+enum class OcclusionDumpResult {
+    Emulated,          ///< Emulated counters at the dump address (all samples visible).
+    EmulatedWithBegin, ///< Emulated counters at the dump address and 8 bytes before it.
+    Counted,           ///< Written (or to be written) by the GPU, nothing to write.
+};
 
 class Rasterizer {
 public:
@@ -86,6 +195,13 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+
+    /// Handles a ZPASS_DONE counter dump of the command processor (see OcclusionQueries).
+    OcclusionDumpResult OcclusionDump(VAddr address, u32 num_pairs);
+
+    /// Whether the memory is the result of a counted occlusion query; value is set to what
+    /// the 32 bit word holds when known without reading it back from the GPU.
+    bool IsCountedOcclusionResult(VAddr address, std::optional<u32>& value) const;
     void OnFence();
 
     PipelineCache& GetPipelineCache() {
@@ -165,6 +281,18 @@ private:
     PipelineCache pipeline_cache;
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
+    OcclusionQueries occlusion{instance, scheduler};
+
+    /// Forgets the results of counted occlusion queries in this range (written again).
+    void ForgetCountedResults(VAddr address, u64 size);
+    struct CountedResults {
+        VAddr address;
+        u32 num_pairs;  ///< Counter pairs written by the GPU.
+        u32 num_counts; ///< Pairs whose end counter holds samples counted by the GPU.
+    };
+    static constexpr size_t MaxCountedResults = 64;
+    /// Results of the last occlusion queries counted by the GPU, most recent last.
+    boost::container::static_vector<CountedResults, MaxCountedResults> counted_results;
 
     /// A texture bound by a stage. Only the view and the type of the descriptor it was found with
     /// are needed to bind it, and copying all of it, nearly 400 bytes, was a good part of binding

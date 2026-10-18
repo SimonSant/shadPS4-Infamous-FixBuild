@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include "common/infamous_tuning.h"
 #include "common/perf_profiler.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -21,6 +22,177 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+OcclusionQueries::OcclusionQueries(const Instance& instance_, Scheduler& scheduler_)
+    : instance{instance_}, scheduler{scheduler_} {
+    const vk::QueryPoolCreateInfo pool_info = {
+        .queryType = vk::QueryType::eOcclusion,
+        .queryCount = NumQueries,
+    };
+    auto [result, query_pool] = instance.GetDevice().createQueryPoolUnique(pool_info);
+    ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create occlusion query pool: {}",
+               vk::to_string(result));
+    pool = std::move(query_pool);
+    if (instance.IsOcclusionQueryPreciseSupported()) {
+        control_flags = vk::QueryControlFlagBits::ePrecise;
+    }
+    scheduler.SetRenderingObserver(this);
+}
+
+OcclusionQueries::~OcclusionQueries() {
+    scheduler.SetRenderingObserver(nullptr);
+}
+
+void OcclusionQueries::OnBeginRendering(const CommandRecorder& cmdbuf) {
+    if (!open.empty() && !active) {
+        BeginSegment(cmdbuf);
+    }
+}
+
+void OcclusionQueries::OnEndRendering(const CommandRecorder& cmdbuf) {
+    if (active) {
+        EndSegment(cmdbuf);
+    }
+}
+
+bool OcclusionQueries::Begin(VAddr address, u32 num_pairs) {
+    // A query begun again at the same address starts over.
+    for (auto it = open.begin(); it != open.end(); ++it) {
+        if (it->address == address) {
+            open.erase(it);
+            break;
+        }
+    }
+    if (open.size() >= MaxOpenQueries) {
+        return false;
+    }
+    Cut();
+    open.push_back(OpenQuery{
+        .address = address,
+        .max_segments = std::clamp<u32>(num_pairs, 1, MaxCounterPairs),
+        .first_segment = static_cast<u32>(segments.size()),
+        .frame = frame,
+        .incomplete = false,
+    });
+    Resume();
+    return true;
+}
+
+bool OcclusionQueries::End(VAddr begin_address,
+                           boost::container::static_vector<u32, MaxCounterPairs>& out_queries) {
+    const auto it = std::find_if(open.begin(), open.end(), [begin_address](const OpenQuery& q) {
+        return q.address == begin_address;
+    });
+    if (it == open.end()) {
+        return false;
+    }
+    Cut();
+    const OpenQuery query = *it;
+    open.erase(it);
+    const u32 num_segments = static_cast<u32>(segments.size()) - query.first_segment;
+    const bool counted = !query.incomplete && num_segments <= query.max_segments;
+    if (counted) {
+        out_queries.assign(segments.begin() + query.first_segment, segments.end());
+    }
+    DropOldSegments();
+    return counted;
+}
+
+void OcclusionQueries::DropOldSegments() {
+    u32 oldest = static_cast<u32>(segments.size());
+    for (const OpenQuery& q : open) {
+        oldest = std::min(oldest, q.first_segment);
+    }
+    if (oldest == 0) {
+        return;
+    }
+    if (active && oldest == segments.size()) {
+        // The active segment counts for no open query.
+        --oldest;
+    }
+    segments.erase(segments.begin(), segments.begin() + oldest);
+    for (OpenQuery& q : open) {
+        q.first_segment -= oldest;
+    }
+}
+
+void OcclusionQueries::OnFrameEnd() {
+    ++frame;
+    const auto old_size = open.size();
+    for (auto it = open.begin(); it != open.end();) {
+        if (frame - it->frame > 2) {
+            it = open.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (open.size() == old_size) {
+        return;
+    }
+    if (open.empty()) {
+        Cut();
+        segments.clear();
+        return;
+    }
+    DropOldSegments();
+}
+
+void OcclusionQueries::AbandonAll() {
+    Cut();
+    open.clear();
+    segments.clear();
+}
+
+void OcclusionQueries::MarkUsed(std::span<const u32> queries) {
+    const u64 tick = scheduler.CurrentTick();
+    for (const u32 query : queries) {
+        query_ticks[query] = tick;
+    }
+}
+
+void OcclusionQueries::Cut() {
+    if (active) {
+        EndSegment(scheduler.CommandBuffer());
+    }
+}
+
+void OcclusionQueries::Resume() {
+    if (!open.empty() && !active && scheduler.IsRendering()) {
+        BeginSegment(scheduler.CommandBuffer());
+    }
+}
+
+void OcclusionQueries::BeginSegment(const CommandRecorder& cmdbuf) {
+    const auto not_counted = [this] {
+        // The samples of the open queries until the next segment are lost.
+        for (OpenQuery& q : open) {
+            q.incomplete = true;
+        }
+    };
+    if (segments.size() >= MaxSegments || !instance.IsHostQueryResetSupported()) {
+        not_counted();
+        return;
+    }
+    const u32 query = next_query;
+    const u64 last_use = query_ticks[query];
+    if (last_use != 0 && !scheduler.IsFree(last_use)) {
+        // Its last use (thousands of queries ago) is still executing.
+        not_counted();
+        return;
+    }
+    next_query = (next_query + 1) % NumQueries;
+    // Reset from the host, as this is inside a rendering scope.
+    instance.GetDevice().resetQueryPool(*pool, query, 1);
+    query_ticks[query] = scheduler.CurrentTick();
+    cmdbuf.beginQuery(*pool, query, control_flags);
+    segments.push_back(query);
+    active = true;
+}
+
+void OcclusionQueries::EndSegment(const CommandRecorder& cmdbuf) {
+    cmdbuf.endQuery(*pool, segments.back());
+    active = false;
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -205,8 +377,13 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         image.binding.is_target = 1u;
     }
 
+    // The PS4 depth block counts the samples of occlusion queries even when the depth test is
+    // off (a query without depth test measures the full size of the tested shape). Host GPUs
+    // count them in their depth unit: the depth buffer stays attached while a query is open.
+    const bool depth_for_query = occlusion.HasOpen() && regs.depth_buffer.DepthValid();
     if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
-        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid())) {
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid()) ||
+        depth_for_query) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
@@ -621,6 +798,9 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    Common::Infamous::GuestFrameCounter().fetch_add(1, std::memory_order_relaxed);
+    Common::Infamous::RefreshTuning();
+    occlusion.OnFrameEnd();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -1522,6 +1702,105 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .size = num_bytes,
     };
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
+}
+
+OcclusionDumpResult Rasterizer::OcclusionDump(VAddr address, u32 num_pairs) {
+    if (!Common::Infamous::GetTuning().real_occlusion.load(std::memory_order_relaxed)) {
+        // Real queries just turned off: a query begun counted (nothing written at its begin
+        // dump) gets consistent emulated counters at both dumps.
+        const bool begun_counted =
+            address % 16 == sizeof(u64) && occlusion.IsOpen(address - sizeof(u64));
+        if (occlusion.HasOpen()) {
+            occlusion.AbandonAll();
+        }
+        counted_results.clear();
+        return begun_counted ? OcclusionDumpResult::EmulatedWithBegin
+                             : OcclusionDumpResult::Emulated;
+    }
+    num_pairs = std::clamp<u32>(num_pairs, 1, OcclusionQueries::MaxCounterPairs);
+    const u32 size = num_pairs * 2 * sizeof(u64);
+    const auto emulated = [](OcclusionDumpResult result, std::string_view) { return result; };
+    if (address % 16 == 0) {
+        // Begin dump: nothing is written, the GPU writes the whole query at the end dump.
+        ForgetCountedResults(address, size);
+        if (!IsMapped(address, size)) {
+            return emulated(OcclusionDumpResult::Emulated, "unmapped");
+        }
+        if (!occlusion.Begin(address, num_pairs)) {
+            return emulated(OcclusionDumpResult::Emulated, "too many open");
+        }
+        return OcclusionDumpResult::Counted;
+    }
+    if (address % 16 != sizeof(u64)) {
+        return emulated(OcclusionDumpResult::Emulated, "unaligned");
+    }
+    // End dump. The begin dump of the query was not written: when the GPU did not count the
+    // query, both are emulated, so that the query sees all its samples visible.
+    const VAddr results = address - sizeof(u64);
+    ForgetCountedResults(results, size);
+    boost::container::static_vector<u32, OcclusionQueries::MaxCounterPairs> queries;
+    if (!occlusion.End(results, queries)) {
+        // The other open queries go on counting.
+        occlusion.Resume();
+        return emulated(OcclusionDumpResult::EmulatedWithBegin, "not counted");
+    }
+    texture_cache.InvalidateMemoryFromGPU(results, size);
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(results, size, true);
+    const std::span<const u32> used{queries.data(), queries.size()};
+    runtime.WriteOcclusionResults(buffer, offset, num_pairs, occlusion.Pool(), used);
+    occlusion.MarkUsed(used);
+    if (counted_results.size() == MaxCountedResults) {
+        counted_results.erase(counted_results.begin());
+    }
+    counted_results.push_back(CountedResults{
+        .address = results,
+        .num_pairs = num_pairs,
+        .num_counts = std::min<u32>(static_cast<u32>(queries.size()), num_pairs),
+    });
+    // Writing the results ended the rendering scope: the other open queries go on counting from
+    // the next one.
+    occlusion.Resume();
+    return OcclusionDumpResult::Counted;
+}
+
+bool Rasterizer::IsCountedOcclusionResult(VAddr address, std::optional<u32>& value) const {
+    // Written by Runtime::WriteOcclusionResults: every counter is valid (bit 63), begin counters
+    // are 0 and the low half of an end counter holds the samples of its segment, if any.
+    static constexpr u32 ValidBit = 0x80000000U;
+    value.reset();
+    for (auto it = counted_results.rbegin(); it != counted_results.rend(); ++it) {
+        if (address < it->address || address >= it->address + it->num_pairs * 2 * sizeof(u64)) {
+            continue;
+        }
+        const u64 offset = address - it->address;
+        const u32 pair = static_cast<u32>(offset / (2 * sizeof(u64)));
+        switch ((offset % (2 * sizeof(u64))) / sizeof(u32)) {
+        case 0: // Begin counter, low half.
+            value = 0U;
+            break;
+        case 2: // End counter, low half: the samples counted, unknown until the GPU is done.
+            if (pair >= it->num_counts) {
+                value = 0U;
+            }
+            break;
+        default: // High halves.
+            value = ValidBit;
+            break;
+        }
+        return true;
+    }
+    return false;
+}
+
+void Rasterizer::ForgetCountedResults(VAddr address, u64 size) {
+    if (counted_results.empty()) [[likely]] {
+        return;
+    }
+    const auto overlaps = [address, size](const CountedResults& r) {
+        return address < r.address + r.num_pairs * 2 * sizeof(u64) && r.address < address + size;
+    };
+    counted_results.erase(std::remove_if(counted_results.begin(), counted_results.end(), overlaps),
+                          counted_results.end());
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {

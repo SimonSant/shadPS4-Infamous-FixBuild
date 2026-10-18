@@ -489,15 +489,23 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    CommandBuffer().beginRendering(rendering_info);
+    const CommandRecorder cmdbuf = CommandBuffer();
+    cmdbuf.beginRendering(rendering_info);
+    if (rendering_observer) {
+        rendering_observer->OnBeginRendering(cmdbuf);
+    }
 }
 
 void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
+    const CommandRecorder cmdbuf = CommandBuffer();
+    if (rendering_observer) {
+        rendering_observer->OnEndRendering(cmdbuf);
+    }
     is_rendering = false;
-    CommandBuffer().endRendering();
+    cmdbuf.endRendering();
 }
 
 CommandRecorder Scheduler::UploadCommandBuffer() {

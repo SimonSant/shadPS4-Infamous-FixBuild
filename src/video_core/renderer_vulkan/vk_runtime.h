@@ -55,6 +55,12 @@ public:
 
     void InlineData(VideoCore::Buffer* dst, u64 offset, u32 value);
 
+    /// Writes the 64 bit counter pairs of a guest occlusion query: begin counters 0, end counters
+    /// valid (bit 63), the low half of each end counter replaced by the samples the Vulkan query
+    /// of its segment counted (queries[i] for pair i; pairs without one keep 0).
+    void WriteOcclusionResults(const VideoCore::Buffer* dst, u64 offset, u32 num_pairs,
+                               vk::QueryPool pool, std::span<const u32> queries);
+
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                  std::optional<VideoCore::SubresourceRange> subres_range = {});

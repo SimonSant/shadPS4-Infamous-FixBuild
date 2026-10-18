@@ -3,9 +3,13 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include "common/assert.h"
 #include "common/bit_field.h"
+#include "common/infamous_tuning.h"
 #include "common/types.h"
 #include "common/uint128.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
@@ -337,11 +341,79 @@ enum class InterruptSelect : u32 {
     IrqUndocumented = 3,
 };
 
+/// Divides the progress of a clock the guest reads through GPU commands (end of pipe
+/// timestamps), staying continuous when the divisor changes. Games measure their GPU frame time
+/// with these timestamps; here they advance when the command processor thread handles the
+/// commands, not when the GPU executes them. gpu_clock_div in perf_tuning.ini.
+struct ScaledGpuClock {
+    u64 base_host{};
+    u64 base_value{};
+    u32 div{1};
+    bool started{};
+
+    u64 operator()(u64 host_now, u32 new_div) {
+        if (!started) {
+            base_host = host_now;
+            base_value = host_now;
+            started = true;
+        }
+        new_div = std::max<u32>(new_div, 1);
+        if (new_div != div) {
+            base_value += (host_now - base_host) / div;
+            base_host = host_now;
+            div = new_div;
+        }
+        return base_value + (host_now - base_host) / div;
+    }
+};
+
+/// Clock locked to the guest frame (gpu_clock_frame_us in perf_tuning.ini): frame count times the frame
+/// time, plus a tick per event so that successive events read increasing times. Continuous with
+/// the host clock when it is turned on or off.
+struct FrameLockedGpuClock {
+    u64 offset{};
+    u64 last_value{};
+    u64 events{};
+    u64 last_frame{};
+    bool active{};
+
+    u64 operator()(u64 host_value, u32 frame_us, u64 ticks_per_us) {
+        if (frame_us == 0) {
+            if (active) {
+                // Back to the host clock, from where this one stopped.
+                active = false;
+                offset = last_value - host_value;
+            }
+            last_value = host_value + offset;
+            return last_value;
+        }
+        const u64 frame = Common::Infamous::GuestFrameCounter().load(std::memory_order_relaxed);
+        if (!active) {
+            active = true;
+            last_frame = frame;
+            events = 0;
+            offset = last_value;
+        } else if (frame != last_frame) {
+            offset += (frame - last_frame) * u64{frame_us} * ticks_per_us;
+            last_frame = frame;
+            events = 0;
+        }
+        ++events;
+        last_value = offset + events * ticks_per_us;
+        return last_value;
+    }
+};
+
 static u64 GetGpuClock64() {
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = now.time_since_epoch();
     auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
-    return static_cast<u64>(ticks);
+    static ScaledGpuClock clock;
+    static FrameLockedGpuClock locked;
+    const auto& tuning = Common::Infamous::GetTuning();
+    const u64 scaled =
+        clock(static_cast<u64>(ticks), tuning.gpu_clock_div.load(std::memory_order_relaxed));
+    return locked(scaled, tuning.gpu_clock_frame_us.load(std::memory_order_relaxed), 1000);
 }
 
 static u64 GetGpuPerfCounter() {
@@ -351,7 +423,12 @@ static u64 GetGpuPerfCounter() {
     const auto cpu_cycles = Libraries::Kernel::sceKernelReadTsc();
     const auto gpu_cycles = Common::MultiplyAndDivide64(cpu_cycles, gpu_freq, cpu_freq);
 
-    return gpu_cycles;
+    static ScaledGpuClock clock;
+    static FrameLockedGpuClock locked;
+    const auto& tuning = Common::Infamous::GetTuning();
+    const u64 scaled = clock(gpu_cycles, tuning.gpu_clock_div.load(std::memory_order_relaxed));
+    return locked(scaled, tuning.gpu_clock_frame_us.load(std::memory_order_relaxed),
+                  gpu_freq / 1'000'000);
 }
 
 // VGT_EVENT_INITIATOR.EVENT_TYPE
@@ -697,7 +774,33 @@ struct PM4CmdWaitRegMem {
     }
 
     bool Test(std::span<const u32> regs) const {
-        u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
+        return TestValue(mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()]);
+    }
+
+    /// Whether the wait is satisfied whatever the polled value (a sync point of the real command
+    /// processor, such as waiting for the end of a DMA fill with "greater or equal to 0"): the
+    /// value needs no reading then, which may need a GPU readback.
+    bool IsAlwaysSatisfied() const {
+        switch (function.Value()) {
+        case Function::Always:
+            return true;
+        case Function::LessThan:
+            return mask < ref;
+        case Function::LessThanEqual:
+            return mask <= ref;
+        case Function::Equal:
+            return mask == 0 && ref == 0;
+        case Function::NotEqual:
+            return (ref & ~mask) != 0;
+        case Function::GreaterThanEqual:
+            return ref == 0;
+        default:
+            return false;
+        }
+    }
+
+    /// Whether the wait is satisfied when the polled register or memory holds this value.
+    bool TestValue(u32 value) const {
         switch (function.Value()) {
         case Function::Always: {
             return true;

@@ -3,6 +3,7 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include <optional>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/perf_profiler.h"
@@ -70,6 +71,36 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     }
 
     return span.subspan(offset);
+}
+
+void Liverpool::WriteEmulatedOcclusionCounters(VAddr address) {
+    static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
+    static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+    u64* results = reinterpret_cast<u64*>(address);
+    for (u32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+        *results = pixel_counter | OcclusionCounterValidMask;
+    }
+    pixel_counter += OcclusionCounterStep;
+    if (rasterizer) {
+        rasterizer->OnBackingWritten(address, num_counter_pairs * 2 * sizeof(u64));
+    }
+}
+
+bool Liverpool::SkipOcclusionWait(const PM4CmdWaitRegMem& wait) {
+    if (wait.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
+        return false;
+    }
+    if (wait.IsAlwaysSatisfied()) {
+        // Nothing to read: reading memory the GPU wrote (the fill of occlusion counters this
+        // waits for) would wait for the GPU. The commands that follow run after it anyway.
+        return true;
+    }
+    if (!rasterizer) {
+        return false;
+    }
+    std::optional<u32> known;
+    rasterizer->IsCountedOcclusionResult(wait.Address<VAddr>(), known);
+    return known && wait.TestValue(*known);
 }
 
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
@@ -662,13 +693,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     regs.cp_strmout_cntl.offset_update_done = 1;
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                        static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
+                        // Real occlusion queries: the GPU counts the samples of the draws between
+                        // the begin and end dumps (light flares behind walls are not visible).
+                        const VAddr address = event->Address<VAddr>();
+                        const auto result =
+                            rasterizer ? rasterizer->OcclusionDump(address, num_counter_pairs)
+                                       : Vulkan::OcclusionDumpResult::Emulated;
+                        if (result == Vulkan::OcclusionDumpResult::EmulatedWithBegin) {
+                            WriteEmulatedOcclusionCounters(address - sizeof(u64));
                         }
-                        pixel_counter += OcclusionCounterStep;
+                        if (result != Vulkan::OcclusionDumpResult::Counted) {
+                            WriteEmulatedOcclusionCounters(address);
+                        }
                     }
                 }
                 break;
@@ -808,6 +844,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ++sync_count;
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+                if (SkipOcclusionWait(*wait_reg_mem)) {
+                    break;
+                }
                 if (wait_reg_mem->Test(regs.reg_array)) {
                     break;
                 }
@@ -1141,6 +1180,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ++sync_count;
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (SkipOcclusionWait(*wait_reg_mem)) {
+                break;
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }

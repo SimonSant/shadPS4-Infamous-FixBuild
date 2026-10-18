@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <span>
 
 #include "common/assert.h"
@@ -225,6 +226,40 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
     cmdbuf.updateBuffer(dst->Handle(), offset, sizeof(value), &value);
 
     AccessBuffer(dst, offset, sizeof(value), vk::PipelineStageFlagBits2::eCopy,
+                 vk::AccessFlagBits2::eTransferWrite);
+}
+
+void Runtime::WriteOcclusionResults(const VideoCore::Buffer* dst, u64 offset, u32 num_pairs,
+                                    vk::QueryPool pool, std::span<const u32> queries) {
+    static constexpr u64 CounterValid = 1ULL << 63;
+    static constexpr u32 MaxPairs = 16;
+    num_pairs = std::min(num_pairs, MaxPairs);
+    const u64 size = u64{num_pairs} * 2 * sizeof(u64);
+    scheduler.EndRendering();
+    if (IsBufferAccessed(dst, offset, size, true)) {
+        FlushBarriers();
+    }
+
+    // Begin counters 0 and end counters valid: the guest sums end - begin over the pairs.
+    std::array<u64, 2 * MaxPairs> counters;
+    counters.fill(CounterValid);
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.updateBuffer(dst->Handle(), offset, size, counters.data());
+    AccessBuffer(dst, offset, size, vk::PipelineStageFlagBits2::eCopy,
+                 vk::AccessFlagBits2::eTransferWrite);
+    if (queries.empty()) {
+        return;
+    }
+
+    // The sample counts replace the low halves of end counters written above.
+    FlushBarriers();
+    const u32 num_copies = std::min<u32>(static_cast<u32>(queries.size()), num_pairs);
+    for (u32 i = 0; i < num_copies; ++i) {
+        cmdbuf.copyQueryPoolResults(pool, queries[i], 1, dst->Handle(),
+                                    offset + (2 * i + 1) * sizeof(u64), 2 * sizeof(u64),
+                                    vk::QueryResultFlagBits::eWait);
+    }
+    AccessBuffer(dst, offset, size, vk::PipelineStageFlagBits2::eCopy,
                  vk::AccessFlagBits2::eTransferWrite);
 }
 

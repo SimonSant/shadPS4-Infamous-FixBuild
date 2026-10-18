@@ -392,6 +392,22 @@ public:
         Record([=](vk::CommandBuffer cmd) { cmd.resetQueryPool(pool, first, count); });
     }
 
+    void beginQuery(vk::QueryPool pool, u32 query, vk::QueryControlFlags flags) const {
+        Record([=](vk::CommandBuffer cmd) { cmd.beginQuery(pool, query, flags); });
+    }
+
+    void endQuery(vk::QueryPool pool, u32 query) const {
+        Record([=](vk::CommandBuffer cmd) { cmd.endQuery(pool, query); });
+    }
+
+    void copyQueryPoolResults(vk::QueryPool pool, u32 first, u32 count, vk::Buffer dst,
+                              vk::DeviceSize dst_offset, vk::DeviceSize stride,
+                              vk::QueryResultFlags flags) const {
+        Record([=](vk::CommandBuffer cmd) {
+            cmd.copyQueryPoolResults(pool, first, count, dst, dst_offset, stride, flags);
+        });
+    }
+
     void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, u32 query) const {
         Record([=](vk::CommandBuffer cmd) { cmd.writeTimestamp2(stage, pool, query); });
     }

@@ -421,6 +421,7 @@ bool Instance::CreateDevice() {
                 .geometryShader = features.geometryShader,
                 .tessellationShader = features.tessellationShader,
                 .sampleRateShading = features.sampleRateShading,
+                .occlusionQueryPrecise = features.occlusionQueryPrecise,
                 .dualSrcBlend = features.dualSrcBlend,
                 .logicOp = features.logicOp,
                 .multiDrawIndirect = features.multiDrawIndirect,

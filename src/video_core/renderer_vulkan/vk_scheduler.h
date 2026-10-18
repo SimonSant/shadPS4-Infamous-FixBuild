@@ -434,6 +434,17 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 using HostWorkMarkFunc = Common::UniqueFunction<u64>;
 using HostWorkWaitFunc = Common::UniqueFunction<void, u64>;
 
+/// Notified when rendering scopes begin and end, for work that cannot span them (Vulkan
+/// occlusion queries begun inside a rendering scope must end in it).
+class RenderingObserver {
+public:
+    virtual ~RenderingObserver() = default;
+    /// The rendering scope has just begun.
+    virtual void OnBeginRendering(const CommandRecorder& cmdbuf) = 0;
+    /// The rendering scope is about to end.
+    virtual void OnEndRendering(const CommandRecorder& cmdbuf) = 0;
+};
+
 class Scheduler {
 public:
     /// With record_on_thread, the Vulkan commands are recorded and submitted on a thread of the
@@ -555,6 +566,14 @@ public:
     /// Identifies the command buffer being recorded.
     [[nodiscard]] u64 SessionId() const noexcept {
         return session_id;
+    }
+
+    void SetRenderingObserver(RenderingObserver* observer) noexcept {
+        rendering_observer = observer;
+    }
+
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
     }
 
     /// Returns the current command buffer tick.
@@ -818,6 +837,7 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    RenderingObserver* rendering_observer{};
     u32 work_since_submit = 0;
     tracy::VkCtxScope* profiler_scope{};
 

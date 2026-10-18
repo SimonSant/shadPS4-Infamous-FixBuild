@@ -31,6 +31,8 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+struct PM4CmdWaitRegMem;
+
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
@@ -243,6 +245,11 @@ private:
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+
+    /// Writes emulated counters (every sample visible) for a guest occlusion counter dump.
+    void WriteEmulatedOcclusionCounters(VAddr address);
+    /// Whether a wait on memory is satisfied without reading it (see Rasterizer::OcclusionDump).
+    bool SkipOcclusionWait(const PM4CmdWaitRegMem& wait);
 
     struct ConstantEngine {
         void Reset() {

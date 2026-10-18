@@ -89,6 +89,16 @@ public:
         return features.samplerAnisotropy;
     }
 
+    /// Returns true if occlusion queries can count samples exactly
+    bool IsOcclusionQueryPreciseSupported() const {
+        return features.occlusionQueryPrecise;
+    }
+
+    /// Returns true if queries can be reset from the host
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
+    }
+
     /// Returns true if depth bounds testing is supported
     bool IsDepthBoundsSupported() const {
         return features.depthBounds;
