@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <unordered_map>
 #include "common/debug.h"
 #include "common/infamous_tuning.h"
 #include "common/perf_profiler.h"
@@ -443,6 +448,95 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+namespace {
+
+/// Diagnostic for the 4K darkening: logs, at most once a second for each, the draws of the
+/// exposure chain (known pixel shaders, or render areas of 64x64 or less) with their render
+/// target, sampled images and the first values of their constant buffers.
+void LogLumDebug(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
+                 VideoCore::BufferCache& buffer_cache) {
+    if (Common::Infamous::GetTuning().lum_debug.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!ps) {
+        return;
+    }
+    const u64 hash = ps->pgm_hash;
+    const u32 width = regs.screen_scissor.GetWidth();
+    const u32 height = regs.screen_scissor.GetHeight();
+    const bool watched = hash == 0x94b5b8da || hash == 0x2e624729 || hash == 0xa55dac75;
+    if (!watched && (width > 64 || height > 64)) {
+        return;
+    }
+    const auto& cb = regs.color_buffers[0];
+    const bool has_rt = static_cast<bool>(cb);
+    const VAddr rt_address = has_rt ? cb.Address() : 0;
+
+    static std::unordered_map<u64, std::chrono::steady_clock::time_point> last_logged;
+    static std::chrono::steady_clock::time_point second_start{};
+    static u32 lines_this_second = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - second_start >= std::chrono::seconds(1)) {
+        second_start = now;
+        lines_this_second = 0;
+    }
+    const u64 key = hash ^ (u64(rt_address) << 20) ^ (u64(width) << 48) ^ (u64(height) << 34);
+    auto& last = last_logged[key];
+    if (lines_this_second >= 48 || (last != std::chrono::steady_clock::time_point{} &&
+                                     now - last < std::chrono::seconds(1))) {
+        return;
+    }
+    last = now;
+    ++lines_this_second;
+
+    std::string text = fmt::format("LumDebug f={} ps={:#x} area={}x{} rt={:#x} {}x{} fmt={}",
+                                   Common::Infamous::GuestFrameCounter().load(), hash, width,
+                                   height, rt_address, has_rt ? cb.Pitch() : 0u,
+                                   has_rt ? cb.Height() : 0u,
+                                   has_rt ? static_cast<u32>(cb.GetDataFmt()) : 0u);
+    u32 index = 0;
+    for (const auto& desc : ps->images) {
+        if (index >= 4) {
+            break;
+        }
+        const auto image = desc.GetSharp(*ps);
+        text += fmt::format(" img{}={}x{}@{:#x}", index, static_cast<u32>(image.width) + 1,
+                            static_cast<u32>(image.height) + 1, image.Address());
+        ++index;
+    }
+    index = 0;
+    for (const auto& desc : ps->buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        if (index >= 2) {
+            break;
+        }
+        const auto buffer = desc.GetSharp(*ps);
+        const VAddr address = buffer.base_address;
+        const u32 size = std::min<u32>(buffer.GetSize(), 20 * sizeof(float));
+        const u32 slot = index++;
+        if (address == 0 || size < sizeof(float)) {
+            continue;
+        }
+        if (buffer_cache.IsRegionGpuModified(address, size)) {
+            text += fmt::format(" cb{}@{:#x}=gpu", slot, address);
+            continue;
+        }
+        std::array<float, 20> values{};
+        std::memcpy(values.data(), reinterpret_cast<const void*>(address), size);
+        text += fmt::format(" cb{}@{:#x}=[", slot, address);
+        for (u32 i = 0; i < size / sizeof(float); ++i) {
+            text += fmt::format("{}{:.5g}", i ? "," : "", values[i]);
+        }
+        text += "]";
+    }
+    LOG_INFO(Render, "{}", text);
+}
+
+} // Anonymous namespace
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -462,6 +556,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!BindResources(pipeline)) {
         return;
     }
+    LogLumDebug(liverpool->regs, pipeline, buffer_cache);
     const auto state = BeginRendering(pipeline);
     // Before anything of the draw itself is recorded, which has to go with it.
     scheduler.SubmitIfWorkPiledUp(state);
@@ -543,6 +638,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!BindResources(pipeline)) {
         return;
     }
+    LogLumDebug(liverpool->regs, pipeline, buffer_cache);
     const auto state = BeginRendering(pipeline);
     // Before anything of the draw itself is recorded, which has to go with it.
     scheduler.SubmitIfWorkPiledUp(state);

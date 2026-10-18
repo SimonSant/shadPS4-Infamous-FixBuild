@@ -25,6 +25,8 @@ struct Tuning {
     std::atomic<u32> gpu_clock_div{1};
     /// Locks the GPU clock to the guest frame, in microseconds a frame (0 = host time).
     std::atomic<u32> gpu_clock_frame_us{0};
+    /// Logs the small render passes and constant buffers of the exposure chain (diagnostic).
+    std::atomic<u32> lum_debug{0};
 };
 
 inline Tuning& GetTuning() {
@@ -91,15 +93,20 @@ inline void RefreshTuning() {
             tuning.gpu_clock_div.store(
                 static_cast<u32>(std::max<unsigned long>(std::strtoul(value.c_str(), nullptr, 10), 1)),
                 std::memory_order_relaxed);
+        } else if (key == "lum_debug") {
+            tuning.lum_debug.store(static_cast<u32>(std::strtoul(value.c_str(), nullptr, 10)),
+                                   std::memory_order_relaxed);
         } else if (key == "gpu_clock_frame_us") {
             tuning.gpu_clock_frame_us.store(
                 static_cast<u32>(std::strtoul(value.c_str(), nullptr, 10)),
                 std::memory_order_relaxed);
         }
     }
-    LOG_INFO(Render, "perf_tuning.ini: real_occlusion={} gpu_clock_div={} gpu_clock_frame_us={}",
+    LOG_INFO(Render,
+             "perf_tuning.ini: real_occlusion={} gpu_clock_div={} gpu_clock_frame_us={} "
+             "lum_debug={}",
              tuning.real_occlusion.load(), tuning.gpu_clock_div.load(),
-             tuning.gpu_clock_frame_us.load());
+             tuning.gpu_clock_frame_us.load(), tuning.lum_debug.load());
 }
 
 } // namespace Common::Infamous
